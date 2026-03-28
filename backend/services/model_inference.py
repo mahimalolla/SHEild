@@ -4,69 +4,64 @@ from typing import Any, Dict
 
 import cv2
 import numpy as np
-import torch
-import torch.nn as nn
-import torchvision.transforms as transforms
 
 
-class SimpleModel(nn.Module):
+class HeuristicInferenceService:
     """
-    Very simple baseline classifier for hackathon pipeline testing.
+    Hackathon-friendly inference service.
 
-    Input shape after preprocessing:
-    [batch_size, 3, 224, 224]
-
-    Output:
-    logits for 2 classes:
-    - index 0 -> real
-    - index 1 -> fake
+    Instead of using an untrained neural net, this uses visual heuristics
+    from the detected face crop to produce a stable and explainable score.
     """
 
     def __init__(self) -> None:
-        super().__init__()
-        self.flatten = nn.Flatten()
-        self.fc = nn.Linear(224 * 224 * 3, 2)
+        pass
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.flatten(x)
-        return self.fc(x)
-
-
-class ModelInferenceService:
-    """
-    Loads the model once and provides face prediction.
-    """
-
-    def __init__(self) -> None:
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = SimpleModel().to(self.device)
-        self.model.eval()
-
-        self.transform = transforms.Compose(
-            [
-                transforms.ToPILImage(),
-                transforms.Resize((224, 224)),
-                transforms.ToTensor(),
-            ]
-        )
-
-        self.class_names = ["real", "fake"]
-
-    def preprocess_face(self, face_image: np.ndarray) -> torch.Tensor:
+    def _variance_of_laplacian(self, gray: np.ndarray) -> float:
         """
-        Convert BGR face crop to model-ready tensor.
+        Blur metric:
+        lower value -> blurrier image
         """
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def _brightness_score(self, gray: np.ndarray) -> float:
+        """
+        Mean brightness of the face crop.
+        """
+        return float(np.mean(gray))
+
+    def _contrast_score(self, gray: np.ndarray) -> float:
+        """
+        Standard deviation of grayscale intensities.
+        """
+        return float(np.std(gray))
+
+    def _edge_density(self, gray: np.ndarray) -> float:
+        """
+        Ratio of edge pixels in the face crop.
+        """
+        edges = cv2.Canny(gray, 100, 200)
+        return float(np.count_nonzero(edges) / edges.size)
+
+    def analyze_face(self, face_image: np.ndarray) -> Dict[str, float]:
         if face_image is None or face_image.size == 0:
             raise ValueError("Face image is empty or invalid.")
 
-        face_rgb = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
-        tensor = self.transform(face_rgb).unsqueeze(0).to(self.device)
-        return tensor
+        gray = cv2.cvtColor(face_image, cv2.COLOR_BGR2GRAY)
+
+        blur_score = self._variance_of_laplacian(gray)
+        brightness = self._brightness_score(gray)
+        contrast = self._contrast_score(gray)
+        edge_density = self._edge_density(gray)
+
+        return {
+            "blur_score": round(blur_score, 4),
+            "brightness": round(brightness, 4),
+            "contrast": round(contrast, 4),
+            "edge_density": round(edge_density, 4),
+        }
 
     def predict_face(self, face_image: np.ndarray | None) -> Dict[str, Any]:
-        """
-        Predict whether the given face crop is real or fake.
-        """
         if face_image is None:
             return {
                 "label": "no_face_detected",
@@ -75,7 +70,7 @@ class ModelInferenceService:
             }
 
         try:
-            tensor = self.preprocess_face(face_image)
+            metrics = self.analyze_face(face_image)
         except ValueError:
             return {
                 "label": "no_face_detected",
@@ -83,39 +78,65 @@ class ModelInferenceService:
                 "reason_flags": ["invalid_face_crop"],
             }
 
-        with torch.no_grad():
-            outputs = self.model(tensor)
-            probabilities = torch.softmax(outputs, dim=1).cpu().numpy()[0]
+        blur_score = metrics["blur_score"]
+        brightness = metrics["brightness"]
+        contrast = metrics["contrast"]
+        edge_density = metrics["edge_density"]
 
-        real_prob = float(probabilities[0])
-        fake_prob = float(probabilities[1])
+        fake_risk = 0.0
+        flags = []
 
-        if fake_prob > real_prob:
-            label = "fake"
-            confidence = round(fake_prob, 2)
-            flags = ["facial_artifacts_detected"]
-        else:
-            label = "real"
-            confidence = round(real_prob, 2)
-            flags = ["natural_face_pattern"]
+        # Very blurry faces often look suspicious / low quality
+        if blur_score < 80:
+            fake_risk += 0.3
+            flags.append("high_blur_detected")
+        elif blur_score < 150:
+            fake_risk += 0.15
+
+        # Overly dark or bright images can be low confidence / suspicious
+        if brightness < 60 or brightness > 200:
+            fake_risk += 0.2
+            flags.append("abnormal_brightness")
+
+        # Very low contrast can indicate smoothed/generated appearance
+        if contrast < 30:
+            fake_risk += 0.25
+            flags.append("low_contrast_face")
+
+        # Strange lack of edges/detail can look synthetic or overly smoothed
+        if edge_density < 0.03:
+            fake_risk += 0.25
+            flags.append("low_facial_detail")
+
+        fake_risk = min(fake_risk, 0.95)
+        real_score = 1.0 - fake_risk
+
+        if fake_risk >= 0.5:
+            return {
+                "label": "fake",
+                "confidence": round(fake_risk, 2),
+                "reason_flags": flags if flags else ["facial_artifacts_detected"],
+                "raw_scores": {
+                    "real": round(real_score, 4),
+                    "fake": round(fake_risk, 4),
+                },
+                "analysis_metrics": metrics,
+            }
 
         return {
-            "label": label,
-            "confidence": confidence,
-            "reason_flags": flags,
+            "label": "real",
+            "confidence": round(real_score, 2),
+            "reason_flags": ["natural_face_pattern"] if not flags else flags,
             "raw_scores": {
-                "real": round(real_prob, 4),
-                "fake": round(fake_prob, 4),
+                "real": round(real_score, 4),
+                "fake": round(fake_risk, 4),
             },
+            "analysis_metrics": metrics,
         }
 
 
-# Global singleton so model loads once
-inference_service = ModelInferenceService()
+inference_service = HeuristicInferenceService()
 
 
 def predict_face(face_image: np.ndarray | None) -> Dict[str, Any]:
-    """
-    Convenience wrapper for importing directly in app.py
-    """
     return inference_service.predict_face(face_image)
