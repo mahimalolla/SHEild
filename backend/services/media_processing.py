@@ -6,10 +6,6 @@ from typing import Any, Dict, List
 
 
 def read_image_metadata(file_path: str) -> Dict[str, Any]:
-    """
-    Read an image using OpenCV and return basic metadata.
-    Raises ValueError if the image cannot be read.
-    """
     image = cv2.imread(file_path)
 
     if image is None:
@@ -24,11 +20,14 @@ def read_image_metadata(file_path: str) -> Dict[str, Any]:
     }
 
 
+def load_image(file_path: str):
+    image = cv2.imread(file_path)
+    if image is None:
+        raise ValueError("Could not read image file.")
+    return image
+
+
 def read_video_metadata(file_path: str) -> Dict[str, Any]:
-    """
-    Read a video using OpenCV and return basic metadata.
-    Raises ValueError if the video cannot be opened.
-    """
     cap = cv2.VideoCapture(file_path)
 
     if not cap.isOpened():
@@ -57,12 +56,6 @@ def sample_video_frames(
     sample_every_n_frames: int = 30,
     max_frames: int = 10,
 ) -> List[str]:
-    """
-    Sample frames from a video and save them as JPEG files.
-
-    Example:
-    - if sample_every_n_frames=30 and fps is ~30, this saves roughly 1 frame/sec.
-    """
     cap = cv2.VideoCapture(file_path)
 
     if not cap.isOpened():
